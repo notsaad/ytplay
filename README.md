@@ -16,11 +16,18 @@ Run from the repo with a URL:
 cargo run -- 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
 ```
 
+Or use a bare YouTube video ID without quotes:
+
+```bash
+cargo run -- dQw4w9WgXcQ
+```
+
 After playback starts, `ytplay` clears the terminal and shows:
 
 - the video title
 - a progress bar with elapsed and total time
 - keyboard controls for playback and audio
+- a 0-100 volume scale where the default mpv level shows as 50%
 
 Or run without an argument and paste a URL when prompted:
 
@@ -48,6 +55,7 @@ ytplay <url>
 ```
 
 If you are using `zsh`, quote full YouTube URLs on the command line. Characters like `?` and `&` are interpreted by the shell before `ytplay` sees them.
+This is a shell parsing issue, not a terminal-emulator issue, so unquoted full watch URLs cannot be made reliable from inside the Rust program itself. If you want an unquoted one-liner, use a bare video ID instead.
 
 ## Controls
 
@@ -58,6 +66,8 @@ While playback is active in an interactive terminal:
 - `I` raises volume
 - `M` toggles mute
 - `Q` quits playback
+
+The UI volume is capped between `0%` and `100%`. `0%` maps to silence, and the default mpv level appears as `50%`.
 
 ## Why this design
 
