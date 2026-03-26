@@ -6,7 +6,7 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::queue;
-use crossterm::style::Print;
+use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 
 use crate::player::{Control, PlaybackState};
@@ -41,8 +41,44 @@ pub(crate) struct PlaybackView<'a> {
 pub(crate) struct UpNextOverlayView {
     pub(crate) heading: String,
     pub(crate) message: String,
-    pub(crate) items: Vec<String>,
+    pub(crate) items: Vec<OverlayItem>,
     pub(crate) help_lines: Vec<String>,
+}
+
+pub(crate) struct OverlayItem {
+    pub(crate) text: String,
+    pub(crate) selected: bool,
+}
+
+struct DisplayLine {
+    text: String,
+    style: LineStyle,
+}
+
+#[derive(Clone, Copy)]
+enum LineStyle {
+    Normal,
+    Selected,
+}
+
+impl DisplayLine {
+    fn normal(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: LineStyle::Normal,
+        }
+    }
+
+    fn selected(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: LineStyle::Selected,
+        }
+    }
+
+    fn blank() -> Self {
+        Self::normal(String::new())
+    }
 }
 
 impl PlaybackUi {
@@ -107,6 +143,8 @@ impl PlaybackUi {
             KeyCode::Char('i') | KeyCode::Char('I') => Some(Control::VolumeUp),
             KeyCode::Char('m') | KeyCode::Char('M') => Some(Control::ToggleMute),
             KeyCode::Char('n') | KeyCode::Char('N') => Some(Control::ToggleUpNext),
+            KeyCode::Up | KeyCode::Left => Some(Control::MoveUpNext(-1)),
+            KeyCode::Down | KeyCode::Right => Some(Control::MoveUpNext(1)),
             KeyCode::Char('1') => Some(Control::SelectUpNext(0)),
             KeyCode::Char('2') => Some(Control::SelectUpNext(1)),
             KeyCode::Char('3') => Some(Control::SelectUpNext(2)),
@@ -169,40 +207,53 @@ impl<'a> PlaybackView<'a> {
     }
 }
 
-fn compose_lines(view: &PlaybackView<'_>, content_width: usize) -> Vec<String> {
+fn compose_lines(view: &PlaybackView<'_>, content_width: usize) -> Vec<DisplayLine> {
     let mut lines = Vec::new();
     let bar_width = progress_bar_width(content_width as u16);
     let bar = progress_bar(view.progress_ratio, bar_width);
 
-    lines.push(view.title.clone());
-    lines.push(String::new());
-    lines.push(bar);
-    lines.push(format!("{} / {}", view.elapsed, view.total));
-    lines.push(String::new());
-    lines.push(format!("Status: {}  Volume: {}", view.status, view.volume));
+    lines.push(DisplayLine::normal(view.title.clone()));
+    lines.push(DisplayLine::blank());
+    lines.push(DisplayLine::normal(bar));
+    lines.push(DisplayLine::normal(format!(
+        "{} / {}",
+        view.elapsed, view.total
+    )));
+    lines.push(DisplayLine::blank());
+    lines.push(DisplayLine::normal(format!(
+        "Status: {}  Volume: {}",
+        view.status, view.volume
+    )));
 
     if let Some(queue_status) = &view.queue_status {
-        lines.push(queue_status.clone());
+        lines.push(DisplayLine::normal(queue_status.clone()));
     }
 
-    lines.push(String::new());
+    lines.push(DisplayLine::blank());
 
     if let Some(overlay) = &view.overlay {
-        lines.push(overlay.heading.clone());
-        lines.push(overlay.message.clone());
+        lines.push(DisplayLine::normal(overlay.heading.clone()));
+        lines.push(DisplayLine::normal(overlay.message.clone()));
         if !overlay.items.is_empty() {
-            lines.push(String::new());
-            lines.extend(overlay.items.iter().cloned());
+            lines.push(DisplayLine::blank());
+            lines.extend(overlay.items.iter().map(|item| {
+                if item.selected {
+                    DisplayLine::selected(item.text.clone())
+                } else {
+                    DisplayLine::normal(item.text.clone())
+                }
+            }));
         }
         if !overlay.help_lines.is_empty() {
-            lines.push(String::new());
-            lines.extend(overlay.help_lines.iter().cloned());
+            lines.push(DisplayLine::blank());
+            lines.extend(overlay.help_lines.iter().cloned().map(DisplayLine::normal));
         }
     } else {
-        lines.extend(control_rows_for_width(
-            content_width as u16,
-            &PLAYBACK_CONTROL_HINTS,
-        ));
+        lines.extend(
+            control_rows_for_width(content_width as u16, &PLAYBACK_CONTROL_HINTS)
+                .into_iter()
+                .map(DisplayLine::normal),
+        );
     }
 
     lines
@@ -213,12 +264,33 @@ fn draw_centered_line(
     left: u16,
     y: u16,
     width: u16,
-    text: &str,
+    line: &DisplayLine,
 ) -> Result<()> {
-    let fitted = fit_text(text, width as usize);
+    let fitted = fit_text(&line.text, width as usize);
     let offset = centered_offset(width as usize, fitted.chars().count());
-    queue!(stdout, MoveTo(left + offset as u16, y), Print(fitted))
-        .context("failed to queue centered line")?;
+
+    match line.style {
+        LineStyle::Normal => {
+            queue!(
+                stdout,
+                ResetColor,
+                MoveTo(left + offset as u16, y),
+                Print(fitted)
+            )
+            .context("failed to queue centered line")?;
+        }
+        LineStyle::Selected => {
+            queue!(
+                stdout,
+                SetForegroundColor(Color::Cyan),
+                MoveTo(left + offset as u16, y),
+                Print(fitted),
+                ResetColor
+            )
+            .context("failed to queue styled centered line")?;
+        }
+    }
+
     Ok(())
 }
 
@@ -381,18 +453,29 @@ mod tests {
             Some(UpNextOverlayView {
                 heading: "Up Next".to_string(),
                 message: "Autoplaying 1 in 8s".to_string(),
-                items: vec!["> 1. Song B".to_string(), "  2. Song C".to_string()],
+                items: vec![
+                    OverlayItem {
+                        text: "1. Song B".to_string(),
+                        selected: true,
+                    },
+                    OverlayItem {
+                        text: "2. Song C".to_string(),
+                        selected: false,
+                    },
+                ],
                 help_lines: vec!["1-5 choose   Enter play   Q stop".to_string()],
             }),
         );
 
         let lines = compose_lines(&view, 80);
-        assert!(lines.iter().any(|line| line == "Up Next"));
+        assert!(lines.iter().any(|line| line.text == "Up Next"));
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("Autoplaying 1 in 8s"))
+                .any(|line| line.text.contains("Autoplaying 1 in 8s"))
         );
-        assert!(lines.iter().any(|line| line.contains("> 1. Song B")));
+        assert!(lines.iter().any(|line| {
+            line.text.contains("1. Song B") && matches!(line.style, LineStyle::Selected)
+        }));
     }
 }

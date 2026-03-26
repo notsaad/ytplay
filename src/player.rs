@@ -12,7 +12,7 @@ use tempfile::{Builder, TempDir};
 
 use crate::app::mpv_command;
 use crate::recommendations::{RecommendationsReceiver, UpNextCandidate};
-use crate::ui::{PlaybackUi, PlaybackView, UpNextOverlayView};
+use crate::ui::{OverlayItem, PlaybackUi, PlaybackView, UpNextOverlayView};
 
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -53,6 +53,7 @@ pub(crate) enum Control {
     VolumeUp,
     ToggleMute,
     ToggleUpNext,
+    MoveUpNext(isize),
     SelectUpNext(usize),
     ConfirmUpNext,
     CloseOverlay,
@@ -196,6 +197,9 @@ fn play_stream_with_ui(
                             }
                         }
                     }
+                    Control::MoveUpNext(delta) if up_next.overlay_visible() => {
+                        up_next.move_selection(delta, true);
+                    }
                     Control::ConfirmUpNext => {
                         if let Some(next_candidate) = up_next.next_after_finish() {
                             return Ok(PlaybackOutcome::PlayNext(next_candidate.playback_input()));
@@ -224,6 +228,9 @@ fn play_stream_with_ui(
                     Control::ToggleMute if !up_next.overlay_visible() => session.toggle_mute()?,
                     Control::ToggleUpNext => up_next.toggle_overlay(),
                     Control::CloseOverlay => up_next.close_overlay(),
+                    Control::MoveUpNext(delta) if up_next.overlay_visible() => {
+                        up_next.move_selection(delta, true);
+                    }
                     Control::SelectUpNext(index) => {
                         if up_next.select(index, true) {
                             up_next.close_overlay();
@@ -619,6 +626,26 @@ impl UpNextState {
         true
     }
 
+    fn move_selection(&mut self, delta: isize, explicit: bool) -> bool {
+        let RecommendationsState::Ready(candidates) = &self.source else {
+            return false;
+        };
+
+        if candidates.is_empty() {
+            return false;
+        }
+
+        let max_index = candidates.len().saturating_sub(1) as isize;
+        let next_index = (self.selected_index as isize + delta).clamp(0, max_index) as usize;
+
+        self.selected_index = next_index;
+        if explicit {
+            self.explicit_selection = true;
+        }
+
+        true
+    }
+
     fn selected_candidate(&self) -> Option<UpNextCandidate> {
         let RecommendationsState::Ready(candidates) = &self.source else {
             return None;
@@ -703,6 +730,7 @@ impl UpNextState {
                 },
             }),
             RecommendationsState::Ready(candidates) if !candidates.is_empty() => {
+                let selection_hint = selection_hint_text(candidates.len());
                 let message = if playback_finished {
                     if self.explicit_selection {
                         "Queued selection will start now.".to_string()
@@ -714,32 +742,35 @@ impl UpNextState {
                             })
                             .unwrap_or(0);
                         format!(
-                            "Autoplaying {} in {}s. Press 1-5 to choose or Enter to play now.",
+                            "Autoplaying {} in {}s. Use {} or arrows to choose, Enter to play now.",
                             self.selected_index + 1,
-                            seconds_left
+                            seconds_left,
+                            selection_hint
                         )
                     }
                 } else {
-                    "Press 1-5 to queue the next video.".to_string()
+                    format!("Use {} or arrows to queue the next video.", selection_hint)
                 };
 
                 let items = candidates
                     .iter()
                     .enumerate()
-                    .map(|(index, candidate)| {
-                        let marker = if index == self.selected_index {
-                            '>'
-                        } else {
-                            ' '
-                        };
-                        format!("{marker} {}. {}", index + 1, candidate.display_label())
+                    .map(|(index, candidate)| OverlayItem {
+                        text: format!("{}. {}", index + 1, candidate.display_label()),
+                        selected: index == self.selected_index,
                     })
                     .collect();
 
                 let help_lines = if playback_finished {
-                    vec!["1-5 choose   Enter play   Q stop".to_string()]
+                    vec![format!(
+                        "{} choose   Arrows move   Enter play   Q stop",
+                        selection_hint
+                    )]
                 } else {
-                    vec!["1-5 queue   Enter keep selected   N or Esc close".to_string()]
+                    vec![format!(
+                        "{} queue   Arrows move   Enter keep selected   N or Esc close",
+                        selection_hint
+                    )]
                 };
 
                 Some(UpNextOverlayView {
@@ -770,6 +801,14 @@ fn fit_overlay_error(message: &str) -> String {
         "Recommendations are unavailable.".to_string()
     } else {
         format!("Recommendations unavailable: {trimmed}")
+    }
+}
+
+fn selection_hint_text(candidate_count: usize) -> String {
+    match candidate_count {
+        0 => String::new(),
+        1 => "1".to_string(),
+        count => format!("1-{}", count.min(9)),
     }
 }
 
@@ -887,5 +926,12 @@ mod tests {
 
         let candidate = up_next.next_after_finish().unwrap();
         assert_eq!(candidate.video_id, "two");
+    }
+
+    #[test]
+    fn selection_hint_matches_candidate_count() {
+        assert_eq!(selection_hint_text(0), "");
+        assert_eq!(selection_hint_text(1), "1");
+        assert_eq!(selection_hint_text(4), "1-4");
     }
 }
