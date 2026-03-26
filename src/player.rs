@@ -15,6 +15,8 @@ use crate::ui::{PlaybackUi, PlaybackView};
 
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const UI_VOLUME_STEP: f64 = 5.0;
+const MPV_VOLUME_MULTIPLIER: f64 = 2.0;
 
 #[derive(Debug, Clone)]
 pub(crate) struct PlaybackState {
@@ -128,8 +130,8 @@ fn play_stream_with_ui(mpv_path: &Path, stream_url: &str, title: Option<&str>) -
         if let Some(control) = ui.poll_control()? {
             match control {
                 Control::TogglePause => session.toggle_pause()?,
-                Control::VolumeDown => session.adjust_volume(-5.0)?,
-                Control::VolumeUp => session.adjust_volume(5.0)?,
+                Control::VolumeDown => session.adjust_volume(-UI_VOLUME_STEP)?,
+                Control::VolumeUp => session.adjust_volume(UI_VOLUME_STEP)?,
                 Control::ToggleMute => session.toggle_mute()?,
                 Control::Quit => session.quit()?,
             }
@@ -263,7 +265,7 @@ impl MpvSession {
     }
 
     fn adjust_volume(&mut self, delta: f64) -> Result<()> {
-        let next_volume = (self.volume + delta).clamp(0.0, 130.0);
+        let next_volume = mpv_volume_from_ui(ui_volume_percent(self.volume) + delta);
         self.send_command(json!({ "command": ["set_property", "volume", next_volume] }))
     }
 
@@ -410,6 +412,14 @@ fn initial_request_name(request_id: u64) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn ui_volume_percent(mpv_volume: f64) -> f64 {
+    (mpv_volume / MPV_VOLUME_MULTIPLIER).clamp(0.0, 100.0)
+}
+
+fn mpv_volume_from_ui(ui_volume: f64) -> f64 {
+    (ui_volume.clamp(0.0, 100.0) * MPV_VOLUME_MULTIPLIER).clamp(0.0, 200.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +469,17 @@ mod tests {
         assert!(args.contains(&"--terminal=no".to_string()));
         assert!(args.contains(&"--force-window=no".to_string()));
         assert!(args.contains(&"--input-ipc-server=/tmp/ytplay-test.sock".to_string()));
+    }
+
+    #[test]
+    fn maps_default_mpv_volume_to_fifty_percent_ui() {
+        assert_eq!(ui_volume_percent(100.0), 50.0);
+    }
+
+    #[test]
+    fn caps_ui_volume_range_before_mapping_back_to_mpv() {
+        assert_eq!(mpv_volume_from_ui(-5.0), 0.0);
+        assert_eq!(mpv_volume_from_ui(100.0), 200.0);
+        assert_eq!(mpv_volume_from_ui(150.0), 200.0);
     }
 }

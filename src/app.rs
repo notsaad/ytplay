@@ -90,7 +90,28 @@ fn normalize_url(url: String) -> Result<String> {
         bail!("URL cannot be empty.");
     }
 
+    if looks_like_youtube_id(trimmed) {
+        return Ok(format!("https://www.youtube.com/watch?v={trimmed}"));
+    }
+
+    if looks_like_youtube_url_without_scheme(trimmed) {
+        return Ok(format!("https://{trimmed}"));
+    }
+
     Ok(trimmed.to_owned())
+}
+
+fn looks_like_youtube_id(input: &str) -> bool {
+    input.len() == 11
+        && input
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+fn looks_like_youtube_url_without_scheme(input: &str) -> bool {
+    input.starts_with("youtu.be/")
+        || input.starts_with("youtube.com/")
+        || input.starts_with("www.youtube.com/")
 }
 
 impl Dependencies {
@@ -288,6 +309,18 @@ mod tests {
 
         assert_eq!(extracted.title, None);
         assert_eq!(extracted.stream_url, "https://stream.example/audio");
+    }
+
+    #[test]
+    fn normalizes_bare_video_id_to_watch_url() {
+        let normalized = normalize_url("dQw4w9WgXcQ".to_string()).unwrap();
+        assert_eq!(normalized, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+    }
+
+    #[test]
+    fn adds_scheme_to_youtube_host_without_one() {
+        let normalized = normalize_url("youtu.be/dQw4w9WgXcQ".to_string()).unwrap();
+        assert_eq!(normalized, "https://youtu.be/dQw4w9WgXcQ");
     }
 
     #[test]
