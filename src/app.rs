@@ -166,9 +166,9 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return fs::metadata(path)
+        fs::metadata(path)
             .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false);
+            .unwrap_or(false)
     }
 
     #[cfg(not(unix))]
@@ -290,6 +290,41 @@ fn format_exit_status(status: &std::process::ExitStatus) -> String {
         .code()
         .map(|code| code.to_string())
         .unwrap_or_else(|| "terminated by signal".to_string())
+}
+
+fn parse_video_metadata(output: &str) -> Result<VideoMetadata> {
+    let payload: Value =
+        serde_json::from_str(output).context("failed to parse yt-dlp metadata JSON")?;
+
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("yt-dlp metadata was missing a title"))?
+        .to_string();
+    let video_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let uploader = payload
+        .get("uploader")
+        .or_else(|| payload.get("channel"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    Ok(VideoMetadata {
+        title: recommendations::sanitize_title(&title),
+        video_id,
+        uploader,
+    })
+}
+
+fn parse_stream_output(output: &str) -> Result<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("`yt-dlp` did not return a playable stream URL."))
 }
 
 #[cfg(test)]
@@ -440,39 +475,4 @@ mod tests {
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
     }
-}
-
-fn parse_video_metadata(output: &str) -> Result<VideoMetadata> {
-    let payload: Value =
-        serde_json::from_str(output).context("failed to parse yt-dlp metadata JSON")?;
-
-    let title = payload
-        .get("title")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("yt-dlp metadata was missing a title"))?
-        .to_string();
-    let video_id = payload
-        .get("id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let uploader = payload
-        .get("uploader")
-        .or_else(|| payload.get("channel"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-
-    Ok(VideoMetadata {
-        title: recommendations::sanitize_title(&title),
-        video_id,
-        uploader,
-    })
-}
-
-fn parse_stream_output(output: &str) -> Result<String> {
-    output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow!("`yt-dlp` did not return a playable stream URL."))
 }

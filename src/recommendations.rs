@@ -51,12 +51,12 @@ pub(crate) fn sanitize_title(title: &str) -> String {
         let mut changed = false;
 
         for separator in [" | ", " - ", " — ", " – "] {
-            if let Some((head, tail)) = cleaned.rsplit_once(separator) {
-                if is_branding_suffix(tail) {
-                    cleaned = head.trim_end().to_string();
-                    changed = true;
-                    break;
-                }
+            if let Some((head, tail)) = cleaned.rsplit_once(separator)
+                && is_branding_suffix(tail)
+            {
+                cleaned = head.trim_end().to_string();
+                changed = true;
+                break;
             }
         }
 

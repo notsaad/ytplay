@@ -168,14 +168,14 @@ fn play_stream_with_ui(
                 }
             }
 
-            if finished_code.is_none() {
-                if let Some(code) = session.try_wait()? {
-                    finished_code = Some(code);
-                    if code != 0 || stop_requested {
-                        return Ok(PlaybackOutcome::Finished(code));
-                    }
-                    up_next.on_playback_finished();
+            if finished_code.is_none()
+                && let Some(code) = session.try_wait()?
+            {
+                finished_code = Some(code);
+                if code != 0 || stop_requested {
+                    return Ok(PlaybackOutcome::Finished(code));
                 }
+                up_next.on_playback_finished();
             }
         }
 
@@ -189,12 +189,10 @@ fn play_stream_with_ui(
             if finished_code.is_some() {
                 match control {
                     Control::SelectUpNext(index) => {
-                        if up_next.select(index, true) {
-                            if let Some(next_candidate) = up_next.next_after_finish() {
-                                return Ok(PlaybackOutcome::PlayNext(
-                                    next_candidate.playback_input(),
-                                ));
-                            }
+                        if up_next.select(index, true)
+                            && let Some(next_candidate) = up_next.next_after_finish()
+                        {
+                            return Ok(PlaybackOutcome::PlayNext(next_candidate.playback_input()));
                         }
                     }
                     Control::MoveUpNext(delta) if up_next.overlay_visible() => {
@@ -348,10 +346,10 @@ impl MpvSession {
     fn try_recv_event(&mut self) -> std::result::Result<PlayerEvent, mpsc::TryRecvError> {
         match self.events.try_recv() {
             Ok(PlayerEvent::PropertyChange { name, data }) => {
-                if name == "volume" {
-                    if let Some(value) = data.as_f64() {
-                        self.volume = value;
-                    }
+                if name == "volume"
+                    && let Some(value) = data.as_f64()
+                {
+                    self.volume = value;
                 }
 
                 Ok(PlayerEvent::PropertyChange { name, data })
@@ -470,10 +468,10 @@ fn spawn_event_reader(stream: UnixStream) -> Receiver<PlayerEvent> {
                 break;
             };
 
-            if let Some(event) = parse_player_event(&line) {
-                if tx.send(event).is_err() {
-                    break;
-                }
+            if let Some(event) = parse_player_event(&line)
+                && tx.send(event).is_err()
+            {
+                break;
             }
         }
 
