@@ -382,6 +382,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_video_metadata_and_strips_branding_suffix() {
+        let metadata = parse_video_metadata(
+            r#"{"id":"abc123","title":"Example Title | PoweredbyREC.","uploader":"Example Uploader"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.title, "Example Title");
+    }
+
+    #[test]
     fn parses_stream_url_output() {
         let stream_url = parse_stream_output("https://stream.example/audio\n").unwrap();
         assert_eq!(stream_url, "https://stream.example/audio");
@@ -452,7 +462,7 @@ fn parse_video_metadata(output: &str) -> Result<VideoMetadata> {
         .map(ToOwned::to_owned);
 
     Ok(VideoMetadata {
-        title,
+        title: recommendations::sanitize_title(&title),
         video_id,
         uploader,
     })

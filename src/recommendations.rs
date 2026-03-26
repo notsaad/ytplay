@@ -39,6 +39,39 @@ impl UpNextCandidate {
     }
 }
 
+pub(crate) fn sanitize_title(title: &str) -> String {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let mut cleaned = trimmed.to_string();
+
+    loop {
+        let mut changed = false;
+
+        for separator in [" | ", " - ", " — ", " – "] {
+            if let Some((head, tail)) = cleaned.rsplit_once(separator) {
+                if is_branding_suffix(tail) {
+                    cleaned = head.trim_end().to_string();
+                    changed = true;
+                    break;
+                }
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    if cleaned.is_empty() {
+        trimmed.to_string()
+    } else {
+        cleaned
+    }
+}
+
 pub(crate) fn spawn_recommendation_fetch(
     yt_dlp_path: PathBuf,
     seed: RecommendationSeed,
@@ -157,12 +190,24 @@ fn parse_recommendations(
 
         candidates.push(UpNextCandidate {
             video_id: video_id.to_string(),
-            title: title.to_string(),
+            title: sanitize_title(title),
             uploader,
         });
     }
 
     Ok(candidates)
+}
+
+fn is_branding_suffix(segment: &str) -> bool {
+    normalize_for_match(segment) == "poweredbyrec"
+}
+
+fn normalize_for_match(input: &str) -> String {
+    input
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
 #[cfg(test)]
@@ -190,7 +235,7 @@ mod tests {
             r#"{
                 "entries": [
                     {"id": "current123", "title": "Current", "uploader": "Uploader"},
-                    {"id": "next1", "title": "Next One", "uploader": "Artist A"},
+                    {"id": "next1", "title": "Next One | PoweredbyREC.", "uploader": "Artist A"},
                     {"id": "next1", "title": "Next One Duplicate", "uploader": "Artist A"},
                     {"id": "next2", "title": "Next Two", "channel": "Artist B"}
                 ]
@@ -204,5 +249,14 @@ mod tests {
         assert_eq!(parsed[0].display_label(), "Next One | Artist A");
         assert_eq!(parsed[1].video_id, "next2");
         assert_eq!(parsed[1].uploader.as_deref(), Some("Artist B"));
+    }
+
+    #[test]
+    fn strips_poweredbyrec_suffix_from_titles() {
+        assert_eq!(
+            sanitize_title("Marsolo | Hide&Seek Festival 2025 | PoweredbyREC."),
+            "Marsolo | Hide&Seek Festival 2025"
+        );
+        assert_eq!(sanitize_title("Track Name - Powered by REC"), "Track Name");
     }
 }
