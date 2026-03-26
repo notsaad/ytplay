@@ -2,10 +2,12 @@ use std::env;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+
+use crate::player;
 
 const INSTALL_HINT: &str = "Install dependencies with: brew install yt-dlp mpv";
 
@@ -27,17 +29,23 @@ struct Dependencies {
 
 pub fn run() -> Result<u8> {
     let cli = Cli::parse();
-    let interactive = io::stdin().is_terminal();
+    let stdin_is_terminal = io::stdin().is_terminal();
     let url = resolve_url(
         cli.url,
-        interactive,
+        stdin_is_terminal,
         &mut io::stdin().lock(),
         &mut io::stdout(),
     )?;
     let deps = Dependencies::detect()?;
+    let use_terminal_ui = stdin_is_terminal && io::stdout().is_terminal();
 
-    let stream_url = extract_stream_url(&deps.yt_dlp, &url)?;
-    play_stream(&deps.mpv, &stream_url)
+    let stream = extract_stream(&deps.yt_dlp, &url)?;
+    player::play_stream(
+        &deps.mpv,
+        &stream.stream_url,
+        stream.title.as_deref(),
+        use_terminal_ui,
+    )
 }
 
 fn resolve_url(
@@ -130,7 +138,12 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn extract_stream_url(yt_dlp_path: &Path, youtube_url: &str) -> Result<String> {
+struct ExtractedStream {
+    title: Option<String>,
+    stream_url: String,
+}
+
+fn extract_stream(yt_dlp_path: &Path, youtube_url: &str) -> Result<ExtractedStream> {
     let output = yt_dlp_command(yt_dlp_path, youtube_url)
         .output()
         .with_context(|| format!("failed to start `{}`", yt_dlp_path.display()))?;
@@ -145,26 +158,7 @@ fn extract_stream_url(yt_dlp_path: &Path, youtube_url: &str) -> Result<String> {
     }
 
     let stdout = String::from_utf8(output.stdout).context("yt-dlp returned non-UTF-8 output")?;
-    stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow!("`yt-dlp` did not return a playable stream URL."))
-}
-
-fn play_stream(mpv_path: &Path, stream_url: &str) -> Result<u8> {
-    let status = mpv_command(mpv_path, stream_url)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .with_context(|| format!("failed to start `{}`", mpv_path.display()))?;
-
-    Ok(status
-        .code()
-        .map(|code| code.clamp(0, u8::MAX as i32) as u8)
-        .unwrap_or(1))
+    parse_stream_output(&stdout)
 }
 
 fn yt_dlp_command(program: &Path, youtube_url: &str) -> Command {
@@ -172,6 +166,7 @@ fn yt_dlp_command(program: &Path, youtube_url: &str) -> Command {
     command.args([
         "--no-playlist",
         "--no-warnings",
+        "--get-title",
         "-f",
         "bestaudio/best",
         "--get-url",
@@ -180,7 +175,7 @@ fn yt_dlp_command(program: &Path, youtube_url: &str) -> Command {
     command
 }
 
-fn mpv_command(program: &Path, stream_url: &str) -> Command {
+pub(crate) fn mpv_command(program: &Path, stream_url: &str) -> Command {
     let mut command = Command::new(program);
     command.args([
         "--no-video",
@@ -269,12 +264,30 @@ mod tests {
             vec![
                 "--no-playlist",
                 "--no-warnings",
+                "--get-title",
                 "-f",
                 "bestaudio/best",
                 "--get-url",
                 "https://example.com/watch?v=1",
             ]
         );
+    }
+
+    #[test]
+    fn parses_title_and_stream_url_from_yt_dlp_output() {
+        let extracted =
+            parse_stream_output("Example Title\nhttps://stream.example/audio\n").unwrap();
+
+        assert_eq!(extracted.title.as_deref(), Some("Example Title"));
+        assert_eq!(extracted.stream_url, "https://stream.example/audio");
+    }
+
+    #[test]
+    fn parses_stream_url_without_title_for_legacy_output() {
+        let extracted = parse_stream_output("https://stream.example/audio\n").unwrap();
+
+        assert_eq!(extracted.title, None);
+        assert_eq!(extracted.stream_url, "https://stream.example/audio");
     }
 
     #[test]
@@ -307,5 +320,25 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+}
+
+fn parse_stream_output(output: &str) -> Result<ExtractedStream> {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    match lines.as_slice() {
+        [stream_url] => Ok(ExtractedStream {
+            title: None,
+            stream_url: (*stream_url).to_string(),
+        }),
+        [title, stream_url, ..] => Ok(ExtractedStream {
+            title: Some((*title).to_string()),
+            stream_url: (*stream_url).to_string(),
+        }),
+        [] => Err(anyhow!("`yt-dlp` did not return a playable stream URL.")),
     }
 }

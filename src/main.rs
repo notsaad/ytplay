@@ -1,4 +1,6 @@
 mod app;
+mod player;
+mod ui;
 
 use std::process::ExitCode;
 
