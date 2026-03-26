@@ -77,7 +77,8 @@ The UI volume is capped between `0%` and `100%`. `0%` maps to silence, and the d
 
 While a track is playing, press `N` to open the `Up Next` panel.
 
-- `1`-`5` queues one of the listed recommendations
+- number keys queue one of the listed recommendations shown on screen
+- arrow keys move the highlighted selection
 - `Enter` keeps the currently selected recommendation
 - `Esc` or `N` closes the panel while the current track keeps playing
 
