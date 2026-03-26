@@ -28,6 +28,7 @@ After playback starts, `ytplay` clears the terminal and shows:
 - a progress bar with elapsed and total time
 - keyboard controls for playback and audio
 - a 0-100 volume scale where the default mpv level shows as 50%
+- an `Up Next` queue based on search results from the current video title/uploader
 
 Or run without an argument and paste a URL when prompted:
 
@@ -62,12 +63,28 @@ This is a shell parsing issue, not a terminal-emulator issue, so unquoted full w
 While playback is active in an interactive terminal:
 
 - `P` toggles play and pause
+- `J` skips back 30 seconds
+- `L` skips forward 30 seconds
 - `U` lowers volume
 - `I` raises volume
 - `M` toggles mute
+- `N` opens or closes the `Up Next` panel
 - `Q` quits playback
 
 The UI volume is capped between `0%` and `100%`. `0%` maps to silence, and the default mpv level appears as `50%`.
+
+## Up Next
+
+While a track is playing, press `N` to open the `Up Next` panel.
+
+- `1`-`5` queues one of the listed recommendations
+- `Enter` keeps the currently selected recommendation
+- `Esc` or `N` closes the panel while the current track keeps playing
+
+When the current track finishes:
+
+- the selected recommendation auto-plays immediately
+- if you never picked one, `ytplay` defaults to recommendation `1` after a short countdown
 
 ## Why this design
 
