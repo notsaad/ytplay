@@ -1,7 +1,8 @@
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 
@@ -88,6 +89,49 @@ fn reports_missing_dependency() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Required dependency"));
     assert!(stderr.contains("brew install yt-dlp mpv"));
+}
+
+#[test]
+fn accepts_url_from_piped_stdin() {
+    let temp = TempDir::new().unwrap();
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir(&bin_dir).unwrap();
+
+    let mpv_log = temp.path().join("mpv.log");
+
+    write_executable(
+        &bin_dir.join("yt-dlp"),
+        "#!/bin/sh\nprintf '%s\\n' 'https://stream.example/from-stdin'\n",
+    );
+    write_executable(
+        &bin_dir.join("mpv"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nexit 0\n",
+            mpv_log.display()
+        ),
+    );
+
+    let mut child = Command::new(binary_path())
+        .env("PATH", &bin_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"https://www.youtube.com/watch?v=piped123\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+
+    let mpv_args = fs::read_to_string(mpv_log).unwrap();
+    assert!(mpv_args.contains("https://stream.example/from-stdin"));
 }
 
 fn binary_path() -> &'static str {

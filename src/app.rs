@@ -51,8 +51,17 @@ fn resolve_url(
     }
 
     if !interactive {
+        let mut buffer = String::new();
+        input
+            .read_line(&mut buffer)
+            .context("failed to read URL from stdin")?;
+
+        if !buffer.trim().is_empty() {
+            return normalize_url(buffer);
+        }
+
         bail!(
-            "No URL provided. Pass a YouTube URL as an argument or run from an interactive terminal."
+            "No URL provided. Pass a quoted YouTube URL as an argument, pipe one on stdin, or run from an interactive terminal."
         );
     }
 
@@ -235,8 +244,19 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Pass a YouTube URL as an argument")
+                .contains("Pass a quoted YouTube URL as an argument")
         );
+    }
+
+    #[test]
+    fn reads_url_from_piped_stdin_in_non_interactive_mode() {
+        let mut input = Cursor::new(b"https://www.youtube.com/watch?v=stdin123\n".to_vec());
+        let mut output = Vec::new();
+
+        let url = resolve_url(None, false, &mut input, &mut output).unwrap();
+
+        assert_eq!(url, "https://www.youtube.com/watch?v=stdin123");
+        assert!(output.is_empty());
     }
 
     #[test]
