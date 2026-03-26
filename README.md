@@ -16,6 +16,12 @@ Run from the repo with a URL:
 cargo run -- 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
 ```
 
+After playback starts, `ytplay` clears the terminal and shows:
+
+- the video title
+- a progress bar with elapsed and total time
+- keyboard controls for playback and audio
+
 Or run without an argument and paste a URL when prompted:
 
 ```bash
@@ -43,6 +49,16 @@ ytplay <url>
 
 If you are using `zsh`, quote full YouTube URLs on the command line. Characters like `?` and `&` are interpreted by the shell before `ytplay` sees them.
 
+## Controls
+
+While playback is active in an interactive terminal:
+
+- `P` toggles play and pause
+- `U` lowers volume
+- `I` raises volume
+- `M` toggles mute
+- `Q` quits playback
+
 ## Why this design
 
 - Keeps the Rust binary small and simple
@@ -53,6 +69,7 @@ If you are using `zsh`, quote full YouTube URLs on the command line. Characters 
 
 - Uses `yt-dlp --no-playlist --no-warnings -f bestaudio/best --get-url`
 - Launches `mpv` in audio-only mode
+- Uses mpv's JSON IPC to render a lightweight in-terminal playback UI
 - Uses conservative cache settings to keep memory usage low
 - Returns mpv's exit code when playback ends
 
