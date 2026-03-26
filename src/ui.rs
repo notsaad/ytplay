@@ -11,11 +11,14 @@ use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlt
 
 use crate::player::{Control, PlaybackState};
 
-const CONTROL_HINTS: [(&str, &str); 5] = [
+const PLAYBACK_CONTROL_HINTS: [(&str, &str); 8] = [
     ("Play/Pause", "P"),
+    ("Back 30", "J"),
+    ("Fwd 30", "L"),
     ("Volume -", "U"),
     ("Volume +", "I"),
     ("Mute", "M"),
+    ("Up Next", "N"),
     ("Quit", "Q"),
 ];
 
@@ -24,12 +27,22 @@ pub(crate) struct PlaybackUi {
 }
 
 pub(crate) struct PlaybackView<'a> {
-    title: &'a str,
-    status: &'a str,
+    title: String,
+    status: String,
     volume: String,
     elapsed: String,
     total: String,
     progress_ratio: f64,
+    queue_status: Option<String>,
+    overlay: Option<UpNextOverlayView>,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+pub(crate) struct UpNextOverlayView {
+    pub(crate) heading: String,
+    pub(crate) message: String,
+    pub(crate) items: Vec<String>,
+    pub(crate) help_lines: Vec<String>,
 }
 
 impl PlaybackUi {
@@ -53,29 +66,21 @@ impl PlaybackUi {
         let (columns, rows) = terminal::size().unwrap_or((100, 24));
         let content_width = columns.saturating_sub(4).clamp(36, 96);
         let left = columns.saturating_sub(content_width) / 2;
-        let control_rows = control_rows_for_width(content_width);
-        let layout_height = 7 + (control_rows.len() as u16 * 2);
+        let content_lines = compose_lines(&view, content_width as usize);
+        let layout_height = content_lines.len() as u16;
         let top = rows.saturating_sub(layout_height) / 2;
 
         execute!(self.stdout, MoveTo(0, 0), Clear(ClearType::All))
             .context("failed to draw terminal UI")?;
 
-        draw_centered_line(&mut self.stdout, left, top, content_width, view.title)?;
-
-        let bar_width = progress_bar_width(content_width);
-        let bar = progress_bar(view.progress_ratio, bar_width);
-        draw_centered_line(&mut self.stdout, left, top + 2, content_width, &bar)?;
-
-        let timing_line = format!("{} / {}", view.elapsed, view.total);
-        draw_centered_line(&mut self.stdout, left, top + 3, content_width, &timing_line)?;
-
-        let status_line = format!("Status: {}  Volume: {}", view.status, view.volume);
-        draw_centered_line(&mut self.stdout, left, top + 5, content_width, &status_line)?;
-
-        let mut row_y = top + 7;
-        for row in control_rows {
-            draw_control_row(&mut self.stdout, left, row_y, content_width, row)?;
-            row_y += 2;
+        for (index, line) in content_lines.iter().enumerate() {
+            draw_centered_line(
+                &mut self.stdout,
+                left,
+                top + index as u16,
+                content_width,
+                line,
+            )?;
         }
 
         self.stdout.flush().context("failed to flush terminal UI")
@@ -96,9 +101,19 @@ impl PlaybackUi {
 
         let control = match key.code {
             KeyCode::Char('p') | KeyCode::Char('P') => Some(Control::TogglePause),
+            KeyCode::Char('j') | KeyCode::Char('J') => Some(Control::SeekBackward),
+            KeyCode::Char('l') | KeyCode::Char('L') => Some(Control::SeekForward),
             KeyCode::Char('u') | KeyCode::Char('U') => Some(Control::VolumeDown),
             KeyCode::Char('i') | KeyCode::Char('I') => Some(Control::VolumeUp),
             KeyCode::Char('m') | KeyCode::Char('M') => Some(Control::ToggleMute),
+            KeyCode::Char('n') | KeyCode::Char('N') => Some(Control::ToggleUpNext),
+            KeyCode::Char('1') => Some(Control::SelectUpNext(0)),
+            KeyCode::Char('2') => Some(Control::SelectUpNext(1)),
+            KeyCode::Char('3') => Some(Control::SelectUpNext(2)),
+            KeyCode::Char('4') => Some(Control::SelectUpNext(3)),
+            KeyCode::Char('5') => Some(Control::SelectUpNext(4)),
+            KeyCode::Enter => Some(Control::ConfirmUpNext),
+            KeyCode::Esc => Some(Control::CloseOverlay),
             KeyCode::Char('q') | KeyCode::Char('Q') => Some(Control::Quit),
             _ => None,
         };
@@ -115,7 +130,11 @@ impl Drop for PlaybackUi {
 }
 
 impl<'a> PlaybackView<'a> {
-    pub(crate) fn from_state(state: &'a PlaybackState) -> Self {
+    pub(crate) fn from_state(
+        state: &'a PlaybackState,
+        queue_status: Option<String>,
+        overlay: Option<UpNextOverlayView>,
+    ) -> Self {
         let status = if state.paused { "Paused" } else { "Playing" };
         let volume = if state.muted {
             format!(
@@ -137,14 +156,56 @@ impl<'a> PlaybackView<'a> {
             .unwrap_or(0.0);
 
         Self {
-            title: state.title.as_str(),
-            status,
+            title: state.title.clone(),
+            status: status.to_string(),
             volume,
             elapsed,
             total,
             progress_ratio,
+            queue_status,
+            overlay,
+            _marker: std::marker::PhantomData,
         }
     }
+}
+
+fn compose_lines(view: &PlaybackView<'_>, content_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let bar_width = progress_bar_width(content_width as u16);
+    let bar = progress_bar(view.progress_ratio, bar_width);
+
+    lines.push(view.title.clone());
+    lines.push(String::new());
+    lines.push(bar);
+    lines.push(format!("{} / {}", view.elapsed, view.total));
+    lines.push(String::new());
+    lines.push(format!("Status: {}  Volume: {}", view.status, view.volume));
+
+    if let Some(queue_status) = &view.queue_status {
+        lines.push(queue_status.clone());
+    }
+
+    lines.push(String::new());
+
+    if let Some(overlay) = &view.overlay {
+        lines.push(overlay.heading.clone());
+        lines.push(overlay.message.clone());
+        if !overlay.items.is_empty() {
+            lines.push(String::new());
+            lines.extend(overlay.items.iter().cloned());
+        }
+        if !overlay.help_lines.is_empty() {
+            lines.push(String::new());
+            lines.extend(overlay.help_lines.iter().cloned());
+        }
+    } else {
+        lines.extend(control_rows_for_width(
+            content_width as u16,
+            &PLAYBACK_CONTROL_HINTS,
+        ));
+    }
+
+    lines
 }
 
 fn draw_centered_line(
@@ -161,41 +222,50 @@ fn draw_centered_line(
     Ok(())
 }
 
-fn draw_control_row(
-    stdout: &mut io::Stdout,
-    left: u16,
-    y: u16,
-    width: u16,
-    items: &[(&str, &str)],
-) -> Result<()> {
-    let cell_width = (width as usize / items.len()).max(10);
+fn control_rows_for_width(width: u16, controls: &[(&str, &str)]) -> Vec<String> {
+    let per_row = if width >= 88 {
+        4
+    } else if width >= 64 {
+        3
+    } else if width >= 44 {
+        2
+    } else {
+        1
+    };
 
-    for (index, (label, key)) in items.iter().enumerate() {
-        let cell_left = left as usize + (index * cell_width);
-        let label_offset = centered_offset(cell_width, label.chars().count());
-        let key_offset = centered_offset(cell_width, key.chars().count());
+    let mut rows = Vec::new();
 
-        queue!(
-            stdout,
-            MoveTo((cell_left + label_offset) as u16, y),
-            Print(*label),
-            MoveTo((cell_left + key_offset) as u16, y + 1),
-            Print(*key)
-        )
-        .context("failed to queue control row")?;
+    for chunk in controls.chunks(per_row) {
+        let cell_width = (width as usize / chunk.len()).max(12);
+        rows.push(format_control_row(chunk, cell_width, true));
+        rows.push(format_control_row(chunk, cell_width, false));
     }
 
-    Ok(())
+    rows
 }
 
-fn control_rows_for_width(width: u16) -> Vec<&'static [(&'static str, &'static str)]> {
-    if width >= 70 {
-        vec![&CONTROL_HINTS]
-    } else if width >= 48 {
-        vec![&CONTROL_HINTS[..3], &CONTROL_HINTS[3..]]
-    } else {
-        CONTROL_HINTS.iter().map(std::slice::from_ref).collect()
+fn format_control_row(items: &[(&str, &str)], cell_width: usize, label_row: bool) -> String {
+    let mut row = String::new();
+
+    for (label, key) in items {
+        let text = if label_row { *label } else { *key };
+        row.push_str(&centered_cell(text, cell_width));
     }
+
+    row.trim_end().to_string()
+}
+
+fn centered_cell(text: &str, width: usize) -> String {
+    let fitted = fit_text(text, width);
+    let text_width = fitted.chars().count();
+    let left_padding = centered_offset(width, text_width);
+    let right_padding = width.saturating_sub(left_padding + text_width);
+    format!(
+        "{}{}{}",
+        " ".repeat(left_padding),
+        fitted,
+        " ".repeat(right_padding)
+    )
 }
 
 fn progress_bar_width(content_width: u16) -> usize {
@@ -273,25 +343,56 @@ mod tests {
             muted: true,
         };
 
-        let view = PlaybackView::from_state(&state);
+        let view =
+            PlaybackView::from_state(&state, Some("Up Next: Another Song".to_string()), None);
         assert_eq!(view.title, "Test Track");
         assert_eq!(view.status, "Paused");
         assert_eq!(view.volume, "50% (muted)");
         assert_eq!(view.elapsed, "00:15");
         assert_eq!(view.total, "01:00");
         assert!((view.progress_ratio - 0.25).abs() < f64::EPSILON);
+        assert_eq!(view.queue_status.as_deref(), Some("Up Next: Another Song"));
     }
 
     #[test]
     fn chooses_multiple_control_rows_for_narrow_terminals() {
-        let rows = control_rows_for_width(50);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].len(), 3);
-        assert_eq!(rows[1].len(), 2);
+        let rows = control_rows_for_width(50, &PLAYBACK_CONTROL_HINTS);
+        assert_eq!(rows.len(), 8);
     }
 
     #[test]
     fn truncates_long_text_with_ascii_ellipsis() {
         assert_eq!(fit_text("abcdefghijklmnopqrstuvwxyz", 10), "abcdefg...");
+    }
+
+    #[test]
+    fn composes_overlay_lines() {
+        let state = PlaybackState {
+            title: "Test Track".to_string(),
+            time_pos: 10.0,
+            duration: Some(60.0),
+            paused: false,
+            volume: 100.0,
+            muted: false,
+        };
+        let view = PlaybackView::from_state(
+            &state,
+            Some("Up Next: Song B".to_string()),
+            Some(UpNextOverlayView {
+                heading: "Up Next".to_string(),
+                message: "Autoplaying 1 in 8s".to_string(),
+                items: vec!["> 1. Song B".to_string(), "  2. Song C".to_string()],
+                help_lines: vec!["1-5 choose   Enter play   Q stop".to_string()],
+            }),
+        );
+
+        let lines = compose_lines(&view, 80);
+        assert!(lines.iter().any(|line| line == "Up Next"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Autoplaying 1 in 8s"))
+        );
+        assert!(lines.iter().any(|line| line.contains("> 1. Song B")));
     }
 }

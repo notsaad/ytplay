@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -11,12 +11,15 @@ use serde_json::{Value, json};
 use tempfile::{Builder, TempDir};
 
 use crate::app::mpv_command;
-use crate::ui::{PlaybackUi, PlaybackView};
+use crate::recommendations::{RecommendationsReceiver, UpNextCandidate};
+use crate::ui::{PlaybackUi, PlaybackView, UpNextOverlayView};
 
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const UI_VOLUME_STEP: f64 = 5.0;
 const MPV_VOLUME_MULTIPLIER: f64 = 2.0;
+const SEEK_SECONDS: i64 = 30;
+const UP_NEXT_AUTOPLAY_DELAY: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone)]
 pub(crate) struct PlaybackState {
@@ -44,10 +47,21 @@ impl Default for PlaybackState {
 #[derive(Debug)]
 pub(crate) enum Control {
     TogglePause,
+    SeekBackward,
+    SeekForward,
     VolumeDown,
     VolumeUp,
     ToggleMute,
+    ToggleUpNext,
+    SelectUpNext(usize),
+    ConfirmUpNext,
+    CloseOverlay,
     Quit,
+}
+
+pub(crate) enum PlaybackOutcome {
+    Finished(u8),
+    PlayNext(String),
 }
 
 #[derive(Debug)]
@@ -69,15 +83,16 @@ pub(crate) fn play_stream(
     stream_url: &str,
     title: Option<&str>,
     use_terminal_ui: bool,
-) -> Result<u8> {
+    recommendations: Option<RecommendationsReceiver>,
+) -> Result<PlaybackOutcome> {
     if use_terminal_ui {
-        return play_stream_with_ui(mpv_path, stream_url, title);
+        return play_stream_with_ui(mpv_path, stream_url, title, recommendations);
     }
 
     play_stream_simple(mpv_path, stream_url)
 }
 
-fn play_stream_simple(mpv_path: &Path, stream_url: &str) -> Result<u8> {
+fn play_stream_simple(mpv_path: &Path, stream_url: &str) -> Result<PlaybackOutcome> {
     let status = mpv_command(mpv_path, stream_url)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -85,55 +100,147 @@ fn play_stream_simple(mpv_path: &Path, stream_url: &str) -> Result<u8> {
         .status()
         .with_context(|| format!("failed to start `{}`", mpv_path.display()))?;
 
-    Ok(exit_code(&status))
+    Ok(PlaybackOutcome::Finished(exit_code(&status)))
 }
 
-fn play_stream_with_ui(mpv_path: &Path, stream_url: &str, title: Option<&str>) -> Result<u8> {
+fn play_stream_with_ui(
+    mpv_path: &Path,
+    stream_url: &str,
+    title: Option<&str>,
+    recommendations: Option<RecommendationsReceiver>,
+) -> Result<PlaybackOutcome> {
     let mut session = MpvSession::start(mpv_path, stream_url, title.is_none())?;
     let mut ui = PlaybackUi::new().context("failed to initialize terminal UI")?;
     let mut state = PlaybackState {
         title: title.unwrap_or("Loading stream...").to_string(),
         ..PlaybackState::default()
     };
+    let mut up_next = UpNextState::new(recommendations);
+    let mut finished_code: Option<u8> = None;
+    let mut stop_requested = false;
 
-    ui.render(PlaybackView::from_state(&state))?;
+    ui.render(PlaybackView::from_state(
+        &state,
+        up_next.status_line(),
+        up_next.overlay_view(false),
+    ))?;
 
     loop {
-        while let Ok(event) = session.try_recv_event() {
-            match event {
-                PlayerEvent::PropertyChange { name, data } => {
-                    apply_property_change(&mut state, &name, data)
-                }
-                PlayerEvent::EndFile { reason, error } => {
-                    if let Some(error) = error.filter(|value| value != "success") {
-                        bail!("mpv playback failed: {error}");
-                    }
+        up_next.poll_receiver();
 
-                    if matches!(reason.as_deref(), Some("error")) {
-                        bail!("mpv playback ended with an error.");
-                    }
+        if let Some(code) = finished_code {
+            if let Some(next_candidate) = up_next.next_after_finish() {
+                return Ok(PlaybackOutcome::PlayNext(next_candidate.playback_input()));
+            }
 
-                    return session.wait_for_exit();
+            if up_next.should_exit_after_finish() {
+                return Ok(PlaybackOutcome::Finished(code));
+            }
+        } else {
+            while let Ok(event) = session.try_recv_event() {
+                match event {
+                    PlayerEvent::PropertyChange { name, data } => {
+                        apply_property_change(&mut state, &name, data)
+                    }
+                    PlayerEvent::EndFile { reason, error } => {
+                        if let Some(error) = error.filter(|value| value != "success") {
+                            bail!("mpv playback failed: {error}");
+                        }
+
+                        if matches!(reason.as_deref(), Some("error")) {
+                            bail!("mpv playback ended with an error.");
+                        }
+
+                        let code = session.wait_for_exit()?;
+                        finished_code = Some(code);
+                        if code != 0 || stop_requested || matches!(reason.as_deref(), Some("quit"))
+                        {
+                            return Ok(PlaybackOutcome::Finished(code));
+                        }
+                        up_next.on_playback_finished();
+                        break;
+                    }
+                    PlayerEvent::Shutdown | PlayerEvent::Disconnected => {
+                        let code = session.wait_for_exit()?;
+                        return Ok(PlaybackOutcome::Finished(code));
+                    }
                 }
-                PlayerEvent::Shutdown | PlayerEvent::Disconnected => {
-                    return session.wait_for_exit();
+            }
+
+            if finished_code.is_none() {
+                if let Some(code) = session.try_wait()? {
+                    finished_code = Some(code);
+                    if code != 0 || stop_requested {
+                        return Ok(PlaybackOutcome::Finished(code));
+                    }
+                    up_next.on_playback_finished();
                 }
             }
         }
 
-        if let Some(code) = session.try_wait()? {
-            return Ok(code);
-        }
-
-        ui.render(PlaybackView::from_state(&state))?;
+        ui.render(PlaybackView::from_state(
+            &state,
+            up_next.status_line(),
+            up_next.overlay_view(finished_code.is_some()),
+        ))?;
 
         if let Some(control) = ui.poll_control()? {
-            match control {
-                Control::TogglePause => session.toggle_pause()?,
-                Control::VolumeDown => session.adjust_volume(-UI_VOLUME_STEP)?,
-                Control::VolumeUp => session.adjust_volume(UI_VOLUME_STEP)?,
-                Control::ToggleMute => session.toggle_mute()?,
-                Control::Quit => session.quit()?,
+            if finished_code.is_some() {
+                match control {
+                    Control::SelectUpNext(index) => {
+                        if up_next.select(index, true) {
+                            if let Some(next_candidate) = up_next.next_after_finish() {
+                                return Ok(PlaybackOutcome::PlayNext(
+                                    next_candidate.playback_input(),
+                                ));
+                            }
+                        }
+                    }
+                    Control::ConfirmUpNext => {
+                        if let Some(next_candidate) = up_next.next_after_finish() {
+                            return Ok(PlaybackOutcome::PlayNext(next_candidate.playback_input()));
+                        }
+                    }
+                    Control::Quit => {
+                        return Ok(PlaybackOutcome::Finished(finished_code.unwrap_or(0)));
+                    }
+                    _ => {}
+                }
+            } else {
+                match control {
+                    Control::TogglePause if !up_next.overlay_visible() => session.toggle_pause()?,
+                    Control::SeekBackward if !up_next.overlay_visible() => {
+                        session.seek_relative(-SEEK_SECONDS)?
+                    }
+                    Control::SeekForward if !up_next.overlay_visible() => {
+                        session.seek_relative(SEEK_SECONDS)?
+                    }
+                    Control::VolumeDown if !up_next.overlay_visible() => {
+                        session.adjust_volume(-UI_VOLUME_STEP)?
+                    }
+                    Control::VolumeUp if !up_next.overlay_visible() => {
+                        session.adjust_volume(UI_VOLUME_STEP)?
+                    }
+                    Control::ToggleMute if !up_next.overlay_visible() => session.toggle_mute()?,
+                    Control::ToggleUpNext => up_next.toggle_overlay(),
+                    Control::CloseOverlay => up_next.close_overlay(),
+                    Control::SelectUpNext(index) => {
+                        if up_next.select(index, true) {
+                            up_next.close_overlay();
+                        }
+                    }
+                    Control::ConfirmUpNext => {
+                        if up_next.has_ready_candidates() {
+                            up_next.mark_explicit();
+                            up_next.close_overlay();
+                        }
+                    }
+                    Control::Quit => {
+                        stop_requested = true;
+                        session.quit()?;
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -262,6 +369,10 @@ impl MpvSession {
 
     fn toggle_pause(&mut self) -> Result<()> {
         self.send_command(json!({ "command": ["cycle", "pause"] }))
+    }
+
+    fn seek_relative(&mut self, seconds: i64) -> Result<()> {
+        self.send_command(json!({ "command": ["seek", seconds, "relative"] }))
     }
 
     fn adjust_volume(&mut self, delta: f64) -> Result<()> {
@@ -420,9 +531,252 @@ fn mpv_volume_from_ui(ui_volume: f64) -> f64 {
     (ui_volume.clamp(0.0, 100.0) * MPV_VOLUME_MULTIPLIER).clamp(0.0, 200.0)
 }
 
+struct UpNextState {
+    source: RecommendationsState,
+    overlay_visible: bool,
+    selected_index: usize,
+    explicit_selection: bool,
+    autoplay_deadline: Option<Instant>,
+}
+
+enum RecommendationsState {
+    Disabled,
+    Loading(RecommendationsReceiver),
+    Ready(Vec<UpNextCandidate>),
+    Failed(String),
+}
+
+impl UpNextState {
+    fn new(receiver: Option<RecommendationsReceiver>) -> Self {
+        let source = receiver
+            .map(RecommendationsState::Loading)
+            .unwrap_or(RecommendationsState::Disabled);
+
+        Self {
+            source,
+            overlay_visible: false,
+            selected_index: 0,
+            explicit_selection: false,
+            autoplay_deadline: None,
+        }
+    }
+
+    fn poll_receiver(&mut self) {
+        let RecommendationsState::Loading(receiver) = &self.source else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(Ok(candidates)) => {
+                self.source = RecommendationsState::Ready(candidates);
+                self.selected_index = 0;
+            }
+            Ok(Err(error)) => {
+                self.source = RecommendationsState::Failed(error.to_string());
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.source = RecommendationsState::Failed(
+                    "recommendation lookup stopped unexpectedly".to_string(),
+                );
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+    }
+
+    fn overlay_visible(&self) -> bool {
+        self.overlay_visible
+    }
+
+    fn toggle_overlay(&mut self) {
+        self.overlay_visible = !self.overlay_visible;
+    }
+
+    fn close_overlay(&mut self) {
+        self.overlay_visible = false;
+    }
+
+    fn has_ready_candidates(&self) -> bool {
+        matches!(&self.source, RecommendationsState::Ready(candidates) if !candidates.is_empty())
+    }
+
+    fn mark_explicit(&mut self) {
+        self.explicit_selection = true;
+    }
+
+    fn select(&mut self, index: usize, explicit: bool) -> bool {
+        let RecommendationsState::Ready(candidates) = &self.source else {
+            return false;
+        };
+
+        if index >= candidates.len() {
+            return false;
+        }
+
+        self.selected_index = index;
+        if explicit {
+            self.explicit_selection = true;
+        }
+        true
+    }
+
+    fn selected_candidate(&self) -> Option<UpNextCandidate> {
+        let RecommendationsState::Ready(candidates) = &self.source else {
+            return None;
+        };
+
+        candidates.get(self.selected_index).cloned()
+    }
+
+    fn on_playback_finished(&mut self) {
+        self.overlay_visible = true;
+
+        if !self.explicit_selection {
+            self.autoplay_deadline = Some(Instant::now() + UP_NEXT_AUTOPLAY_DELAY);
+        }
+    }
+
+    fn next_after_finish(&mut self) -> Option<UpNextCandidate> {
+        if self.explicit_selection {
+            return self.selected_candidate();
+        }
+
+        let deadline = self.autoplay_deadline?;
+        if Instant::now() >= deadline {
+            return self.selected_candidate();
+        }
+
+        None
+    }
+
+    fn should_exit_after_finish(&self) -> bool {
+        match &self.source {
+            RecommendationsState::Disabled => true,
+            RecommendationsState::Loading(_) => false,
+            RecommendationsState::Ready(candidates) => candidates.is_empty(),
+            RecommendationsState::Failed(_) => true,
+        }
+    }
+
+    fn status_line(&self) -> Option<String> {
+        match &self.source {
+            RecommendationsState::Disabled => None,
+            RecommendationsState::Loading(_) => {
+                Some("Up Next: loading recommendations...".to_string())
+            }
+            RecommendationsState::Ready(candidates) if !candidates.is_empty() => Some(format!(
+                "Up Next: {}",
+                candidates[self.selected_index].display_label()
+            )),
+            RecommendationsState::Ready(_) => Some("Up Next: no recommendations found".to_string()),
+            RecommendationsState::Failed(_) => Some("Up Next: unavailable".to_string()),
+        }
+    }
+
+    fn overlay_view(&self, playback_finished: bool) -> Option<UpNextOverlayView> {
+        if !self.overlay_visible {
+            return None;
+        }
+
+        match &self.source {
+            RecommendationsState::Loading(_) => Some(UpNextOverlayView {
+                heading: "Up Next".to_string(),
+                message: if playback_finished {
+                    "Loading recommendations before autoplay...".to_string()
+                } else {
+                    "Loading recommendations...".to_string()
+                },
+                items: Vec::new(),
+                help_lines: if playback_finished {
+                    vec!["Q stop".to_string()]
+                } else {
+                    vec!["N or Esc close".to_string()]
+                },
+            }),
+            RecommendationsState::Failed(error) => Some(UpNextOverlayView {
+                heading: "Up Next".to_string(),
+                message: fit_overlay_error(error),
+                items: Vec::new(),
+                help_lines: if playback_finished {
+                    vec!["Q stop".to_string()]
+                } else {
+                    vec!["N or Esc close".to_string()]
+                },
+            }),
+            RecommendationsState::Ready(candidates) if !candidates.is_empty() => {
+                let message = if playback_finished {
+                    if self.explicit_selection {
+                        "Queued selection will start now.".to_string()
+                    } else {
+                        let seconds_left = self
+                            .autoplay_deadline
+                            .map(|deadline| {
+                                deadline.saturating_duration_since(Instant::now()).as_secs()
+                            })
+                            .unwrap_or(0);
+                        format!(
+                            "Autoplaying {} in {}s. Press 1-5 to choose or Enter to play now.",
+                            self.selected_index + 1,
+                            seconds_left
+                        )
+                    }
+                } else {
+                    "Press 1-5 to queue the next video.".to_string()
+                };
+
+                let items = candidates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, candidate)| {
+                        let marker = if index == self.selected_index {
+                            '>'
+                        } else {
+                            ' '
+                        };
+                        format!("{marker} {}. {}", index + 1, candidate.display_label())
+                    })
+                    .collect();
+
+                let help_lines = if playback_finished {
+                    vec!["1-5 choose   Enter play   Q stop".to_string()]
+                } else {
+                    vec!["1-5 queue   Enter keep selected   N or Esc close".to_string()]
+                };
+
+                Some(UpNextOverlayView {
+                    heading: "Up Next".to_string(),
+                    message,
+                    items,
+                    help_lines,
+                })
+            }
+            RecommendationsState::Ready(_) => Some(UpNextOverlayView {
+                heading: "Up Next".to_string(),
+                message: "No recommendations were found for this track.".to_string(),
+                items: Vec::new(),
+                help_lines: if playback_finished {
+                    vec!["Q stop".to_string()]
+                } else {
+                    vec!["N or Esc close".to_string()]
+                },
+            }),
+            RecommendationsState::Disabled => None,
+        }
+    }
+}
+
+fn fit_overlay_error(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        "Recommendations are unavailable.".to_string()
+    } else {
+        format!("Recommendations unavailable: {trimmed}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
     fn parses_property_change_event() {
@@ -481,5 +835,57 @@ mod tests {
         assert_eq!(mpv_volume_from_ui(-5.0), 0.0);
         assert_eq!(mpv_volume_from_ui(100.0), 200.0);
         assert_eq!(mpv_volume_from_ui(150.0), 200.0);
+    }
+
+    #[test]
+    fn up_next_defaults_to_first_candidate_after_countdown() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(vec![
+            UpNextCandidate {
+                video_id: "one".to_string(),
+                title: "One".to_string(),
+                uploader: Some("Artist".to_string()),
+            },
+            UpNextCandidate {
+                video_id: "two".to_string(),
+                title: "Two".to_string(),
+                uploader: Some("Artist".to_string()),
+            },
+        ]))
+        .unwrap();
+
+        let mut up_next = UpNextState::new(Some(rx));
+        up_next.poll_receiver();
+        up_next.on_playback_finished();
+        up_next.autoplay_deadline = Some(Instant::now());
+
+        let candidate = up_next.next_after_finish().unwrap();
+        assert_eq!(candidate.video_id, "one");
+    }
+
+    #[test]
+    fn up_next_uses_explicit_selection_immediately() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(vec![
+            UpNextCandidate {
+                video_id: "one".to_string(),
+                title: "One".to_string(),
+                uploader: Some("Artist".to_string()),
+            },
+            UpNextCandidate {
+                video_id: "two".to_string(),
+                title: "Two".to_string(),
+                uploader: Some("Artist".to_string()),
+            },
+        ]))
+        .unwrap();
+
+        let mut up_next = UpNextState::new(Some(rx));
+        up_next.poll_receiver();
+        assert!(up_next.select(1, true));
+        up_next.on_playback_finished();
+
+        let candidate = up_next.next_after_finish().unwrap();
+        assert_eq!(candidate.video_id, "two");
     }
 }

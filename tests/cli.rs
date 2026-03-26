@@ -17,9 +17,12 @@ fn plays_stream_with_fake_tools() {
 
     write_executable(
         &bin_dir.join("yt-dlp"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf '%s\\n' 'https://stream.example/audio'\n",
-            ytdlp_log.display()
+        &fake_ytdlp_script(
+            Some(&ytdlp_log),
+            "test123",
+            "Test Video",
+            "Test Uploader",
+            "https://stream.example/audio",
         ),
     );
     write_executable(
@@ -101,7 +104,13 @@ fn accepts_url_from_piped_stdin() {
 
     write_executable(
         &bin_dir.join("yt-dlp"),
-        "#!/bin/sh\nprintf '%s\\n' 'https://stream.example/from-stdin'\n",
+        &fake_ytdlp_script(
+            None,
+            "piped123",
+            "Piped Video",
+            "Test Uploader",
+            "https://stream.example/from-stdin",
+        ),
     );
     write_executable(
         &bin_dir.join("mpv"),
@@ -143,4 +152,20 @@ fn write_executable(path: &Path, contents: &str) {
     let mut permissions = fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).unwrap();
+}
+
+fn fake_ytdlp_script(
+    log_path: Option<&Path>,
+    video_id: &str,
+    title: &str,
+    uploader: &str,
+    stream_url: &str,
+) -> String {
+    let log_line = log_path
+        .map(|path| format!("printf '%s\\n' \"$@\" >> \"{}\"\n", path.display()))
+        .unwrap_or_default();
+
+    format!(
+        "#!/bin/sh\n{log_line}case \" $* \" in\n  *\" --dump-single-json \"*)\n    printf '%s\\n' '{{\"id\":\"{video_id}\",\"title\":\"{title}\",\"uploader\":\"{uploader}\"}}'\n    ;;\n  *\" --get-url \"*)\n    printf '%s\\n' '{stream_url}'\n    ;;\n  *)\n    exit 1\n    ;;\nesac\n"
+    )
 }

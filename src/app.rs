@@ -6,8 +6,10 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use serde_json::Value;
 
-use crate::player;
+use crate::player::{self, PlaybackOutcome};
+use crate::recommendations::{self, RecommendationSeed};
 
 const INSTALL_HINT: &str = "Install dependencies with: brew install yt-dlp mpv";
 
@@ -30,7 +32,7 @@ struct Dependencies {
 pub fn run() -> Result<u8> {
     let cli = Cli::parse();
     let stdin_is_terminal = io::stdin().is_terminal();
-    let url = resolve_url(
+    let mut url = resolve_url(
         cli.url,
         stdin_is_terminal,
         &mut io::stdin().lock(),
@@ -39,13 +41,29 @@ pub fn run() -> Result<u8> {
     let deps = Dependencies::detect()?;
     let use_terminal_ui = stdin_is_terminal && io::stdout().is_terminal();
 
-    let stream = extract_stream(&deps.yt_dlp, &url)?;
-    player::play_stream(
-        &deps.mpv,
-        &stream.stream_url,
-        stream.title.as_deref(),
-        use_terminal_ui,
-    )
+    loop {
+        let stream = extract_stream(&deps.yt_dlp, &url)?;
+        let recommendations = if use_terminal_ui {
+            stream
+                .recommendation_seed()
+                .map(|seed| recommendations::spawn_recommendation_fetch(deps.yt_dlp.clone(), seed))
+        } else {
+            None
+        };
+
+        match player::play_stream(
+            &deps.mpv,
+            &stream.stream_url,
+            Some(&stream.title),
+            use_terminal_ui,
+            recommendations,
+        )? {
+            PlaybackOutcome::Finished(code) => return Ok(code),
+            PlaybackOutcome::PlayNext(next_input) => {
+                url = next_input;
+            }
+        }
+    }
 }
 
 fn resolve_url(
@@ -160,12 +178,15 @@ fn is_executable(path: &Path) -> bool {
 }
 
 struct ExtractedStream {
-    title: Option<String>,
+    title: String,
     stream_url: String,
+    video_id: Option<String>,
+    uploader: Option<String>,
 }
 
 fn extract_stream(yt_dlp_path: &Path, youtube_url: &str) -> Result<ExtractedStream> {
-    let output = yt_dlp_command(yt_dlp_path, youtube_url)
+    let metadata = extract_video_metadata(yt_dlp_path, youtube_url)?;
+    let output = yt_dlp_stream_command(yt_dlp_path, youtube_url)
         .output()
         .with_context(|| format!("failed to start `{}`", yt_dlp_path.display()))?;
 
@@ -179,15 +200,69 @@ fn extract_stream(yt_dlp_path: &Path, youtube_url: &str) -> Result<ExtractedStre
     }
 
     let stdout = String::from_utf8(output.stdout).context("yt-dlp returned non-UTF-8 output")?;
-    parse_stream_output(&stdout)
+    Ok(ExtractedStream {
+        title: metadata.title,
+        stream_url: parse_stream_output(&stdout)?,
+        video_id: metadata.video_id,
+        uploader: metadata.uploader,
+    })
 }
 
-fn yt_dlp_command(program: &Path, youtube_url: &str) -> Command {
+impl ExtractedStream {
+    fn recommendation_seed(&self) -> Option<RecommendationSeed> {
+        if self.title.trim().is_empty() {
+            return None;
+        }
+
+        Some(RecommendationSeed {
+            title: self.title.clone(),
+            uploader: self.uploader.clone(),
+            current_video_id: self.video_id.clone(),
+        })
+    }
+}
+
+struct VideoMetadata {
+    title: String,
+    video_id: Option<String>,
+    uploader: Option<String>,
+}
+
+fn extract_video_metadata(yt_dlp_path: &Path, youtube_url: &str) -> Result<VideoMetadata> {
+    let output = yt_dlp_metadata_command(yt_dlp_path, youtube_url)
+        .output()
+        .with_context(|| format!("failed to start `{}`", yt_dlp_path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`yt-dlp` metadata lookup failed with status {}: {}",
+            format_exit_status(&output.status),
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("yt-dlp returned non-UTF-8 metadata")?;
+    parse_video_metadata(&stdout)
+}
+
+fn yt_dlp_metadata_command(program: &Path, youtube_url: &str) -> Command {
     let mut command = Command::new(program);
     command.args([
         "--no-playlist",
         "--no-warnings",
-        "--get-title",
+        "--skip-download",
+        "--dump-single-json",
+        youtube_url,
+    ]);
+    command
+}
+
+fn yt_dlp_stream_command(program: &Path, youtube_url: &str) -> Command {
+    let mut command = Command::new(program);
+    command.args([
+        "--no-playlist",
+        "--no-warnings",
         "-f",
         "bestaudio/best",
         "--get-url",
@@ -277,7 +352,8 @@ mod tests {
 
     #[test]
     fn builds_yt_dlp_command_with_expected_flags() {
-        let command = yt_dlp_command(Path::new("/bin/yt-dlp"), "https://example.com/watch?v=1");
+        let command =
+            yt_dlp_stream_command(Path::new("/bin/yt-dlp"), "https://example.com/watch?v=1");
 
         let args: Vec<String> = command_lossy_args(&command);
         assert_eq!(
@@ -285,7 +361,6 @@ mod tests {
             vec![
                 "--no-playlist",
                 "--no-warnings",
-                "--get-title",
                 "-f",
                 "bestaudio/best",
                 "--get-url",
@@ -295,20 +370,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_title_and_stream_url_from_yt_dlp_output() {
-        let extracted =
-            parse_stream_output("Example Title\nhttps://stream.example/audio\n").unwrap();
+    fn parses_video_metadata_json() {
+        let metadata = parse_video_metadata(
+            r#"{"id":"abc123","title":"Example Title","uploader":"Example Uploader"}"#,
+        )
+        .unwrap();
 
-        assert_eq!(extracted.title.as_deref(), Some("Example Title"));
-        assert_eq!(extracted.stream_url, "https://stream.example/audio");
+        assert_eq!(metadata.video_id.as_deref(), Some("abc123"));
+        assert_eq!(metadata.title, "Example Title");
+        assert_eq!(metadata.uploader.as_deref(), Some("Example Uploader"));
     }
 
     #[test]
-    fn parses_stream_url_without_title_for_legacy_output() {
-        let extracted = parse_stream_output("https://stream.example/audio\n").unwrap();
-
-        assert_eq!(extracted.title, None);
-        assert_eq!(extracted.stream_url, "https://stream.example/audio");
+    fn parses_stream_url_output() {
+        let stream_url = parse_stream_output("https://stream.example/audio\n").unwrap();
+        assert_eq!(stream_url, "https://stream.example/audio");
     }
 
     #[test]
@@ -356,22 +432,37 @@ mod tests {
     }
 }
 
-fn parse_stream_output(output: &str) -> Result<ExtractedStream> {
-    let lines: Vec<&str> = output
+fn parse_video_metadata(output: &str) -> Result<VideoMetadata> {
+    let payload: Value =
+        serde_json::from_str(output).context("failed to parse yt-dlp metadata JSON")?;
+
+    let title = payload
+        .get("title")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("yt-dlp metadata was missing a title"))?
+        .to_string();
+    let video_id = payload
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let uploader = payload
+        .get("uploader")
+        .or_else(|| payload.get("channel"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    Ok(VideoMetadata {
+        title,
+        video_id,
+        uploader,
+    })
+}
+
+fn parse_stream_output(output: &str) -> Result<String> {
+    output
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-
-    match lines.as_slice() {
-        [stream_url] => Ok(ExtractedStream {
-            title: None,
-            stream_url: (*stream_url).to_string(),
-        }),
-        [title, stream_url, ..] => Ok(ExtractedStream {
-            title: Some((*title).to_string()),
-            stream_url: (*stream_url).to_string(),
-        }),
-        [] => Err(anyhow!("`yt-dlp` did not return a playable stream URL.")),
-    }
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("`yt-dlp` did not return a playable stream URL."))
 }
