@@ -2,13 +2,7 @@
 
 `ytplay` is a small Rust CLI that plays audio from a YouTube URL with low overhead by delegating extraction to `yt-dlp` and playback to `mpv`.
 
-## Why this design
-
-- Keeps the Rust binary small and simple
-- Avoids embedding a downloader, decoder, or browser engine
-- Streams audio only, which keeps memory use and startup time low
-
-## Requirements
+## How to use
 
 Install the runtime dependencies with Homebrew:
 
@@ -16,9 +10,7 @@ Install the runtime dependencies with Homebrew:
 brew install yt-dlp mpv
 ```
 
-## Usage
-
-Build and run with a URL:
+Run from the repo with a URL:
 
 ```bash
 cargo run -- https://www.youtube.com/watch?v=dQw4w9WgXcQ
@@ -30,11 +22,24 @@ Or run without an argument and paste a URL when prompted:
 cargo run
 ```
 
-Once built, the binary interface is:
+If you want a local release binary:
+
+```bash
+cargo build --release
+./target/release/ytplay https://www.youtube.com/watch?v=dQw4w9WgXcQ
+```
+
+The binary interface is:
 
 ```bash
 ytplay <url>
 ```
+
+## Why this design
+
+- Keeps the Rust binary small and simple
+- Avoids embedding a downloader, decoder, or browser engine
+- Streams audio only, which keeps memory use and startup time low
 
 ## Behavior
 
