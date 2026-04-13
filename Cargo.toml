@@ -2,6 +2,7 @@
 name = "ytplay"
 version = "0.1.0"
 edition = "2024"
+default-run = "ytplay"
 
 [dependencies]
 anyhow = "1.0"

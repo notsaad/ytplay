@@ -14,10 +14,7 @@ use crate::recommendations::{self, RecommendationSeed};
 const INSTALL_HINT: &str = "Install dependencies with: brew install yt-dlp mpv";
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "ytplay",
-    about = "Play audio from a YouTube URL in your terminal"
-)]
+#[command(about = "Play audio from a YouTube URL in your terminal")]
 struct Cli {
     /// YouTube URL to play
     url: Option<String>,
