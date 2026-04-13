@@ -10,6 +10,24 @@ Install the runtime dependencies with Homebrew:
 brew install yt-dlp mpv
 ```
 
+Install a global `music` command with Cargo:
+
+```bash
+cargo install --path . --bin music --force
+```
+
+Cargo installs binaries into `~/.cargo/bin`. If `music` is not found from a new shell, add that directory to your `PATH` in `~/.zshrc`:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"
+```
+
+Then you can run the player from any directory:
+
+```bash
+music 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
+```
+
 Run from the repo with a URL:
 
 ```bash
@@ -53,9 +71,10 @@ The binary interface is:
 
 ```bash
 ytplay <url>
+music <url>
 ```
 
-If you are using `zsh`, quote full YouTube URLs on the command line. Characters like `?` and `&` are interpreted by the shell before `ytplay` sees them.
+If you are using `zsh`, quote full YouTube URLs on the command line. Characters like `?` and `&` are interpreted by the shell before `ytplay` or `music` sees them.
 This is a shell parsing issue, not a terminal-emulator issue, so unquoted full watch URLs cannot be made reliable from inside the Rust program itself. If you want an unquoted one-liner, use a bare video ID instead.
 
 ## Controls
